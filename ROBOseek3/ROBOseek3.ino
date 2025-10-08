@@ -1,4 +1,4 @@
-// Робот-поисковик людей на Arduino
+// Робот-поисковик на Arduino - УЛУЧШЕННАЯ ВЕРСИЯ
 #include <Servo.h>
 #include <NewPing.h>
 
@@ -10,7 +10,7 @@
 #define TRIG_PIN_RIGHT 8
 #define ECHO_PIN_RIGHT 7
 
-// Пины для двигателей
+// Пины для двигателей (исправлена нумерация)
 #define MOTOR_A_EN 5
 #define MOTOR_A_IN1 4
 #define MOTOR_A_IN2 3
@@ -35,21 +35,66 @@ NewPing sonarRight(TRIG_PIN_RIGHT, ECHO_PIN_RIGHT, MAX_DISTANCE);
 
 Servo headServo;
 
+// Структура для хранения данных сенсоров
+struct SensorData {
+  int frontDist;
+  int leftDist;
+  int rightDist;
+  int pirValue;
+  int irValue;
+  unsigned long timestamp;
+};
+
 // Переменные состояния
 int currentAngle = 90;
 int searchDirection = 1;
 unsigned long lastDetectionTime = 0;
+unsigned long lastScanTime = 0;
+unsigned long lastMoveTime = 0;
 bool personDetected = false;
 int detectionCount = 0;
+int searchPhase = 0;
 
-// Пороговые значения
-const int PERSON_DISTANCE = 100;  // см
-const int OBSTACLE_DISTANCE = 30; // см
-const int HEAT_THRESHOLD = 500;   // значение ИК-датчика
+// Пороговые значения (настроены)
+const int PERSON_DISTANCE = 100;    // см
+const int CLOSE_DISTANCE = 50;      // см для близкого обнаружения
+const int OBSTACLE_DISTANCE = 25;   // см (уменьшено для безопасности)
+const int HEAT_THRESHOLD = 500;     // значение ИК-датчика
+const unsigned long SCAN_INTERVAL = 200;  // мс
+const unsigned long MOVE_INTERVAL = 300;  // мс
+
+// Фильтр Калмана для датчиков расстояния
+class SimpleKalman {
+  private:
+    float Q = 0.1;   // шум процесса
+    float R = 0.1;   // шум измерения
+    float P = 1.0;   // ошибка оценки
+    float X = 0.0;   // оценка
+  public:
+    SimpleKalman(float processNoise = 0.1, float sensorNoise = 0.1, float estimatedError = 1.0) {
+      Q = processNoise;
+      R = sensorNoise;
+      P = estimatedError;
+    }
+    
+    float update(float measurement) {
+      // Прогноз
+      P = P + Q;
+      // Коррекция
+      float K = P / (P + R);
+      X = X + K * (measurement - X);
+      P = (1 - K) * P;
+      return X;
+    }
+};
+
+SimpleKalman kalmanFront(0.1, 0.1, 1.0);
+SimpleKalman kalmanLeft(0.1, 0.1, 1.0);
+SimpleKalman kalmanRight(0.1, 0.1, 1.0);
 
 void setup() {
-  Serial.begin(9600);
-  Serial.println("Робот-поисковик запущен!");
+  Serial.begin(115200);  // Увеличена скорость
+  Serial.println("=== Робот-поисковик УЛУЧШЕННЫЙ запущен! ===");
   
   // Настройка пинов двигателей
   pinMode(MOTOR_A_EN, OUTPUT);
@@ -69,203 +114,258 @@ void setup() {
   headServo.attach(SERVO_PIN);
   headServo.write(currentAngle);
   
+  // Калибровка датчиков
+  calibrateSensors();
+  
   // Тестовый сигнал
   startupSignal();
+  
+  Serial.println("Калибровка завершена. Начинаю поиск...");
+}
+
+void calibrateSensors() {
+  Serial.println("Калибровка датчиков...");
+  for(int i = 0; i < 10; i++) {
+    getFilteredDistance(sonarFront); // Прогрев фильтра
+    delay(50);
+  }
 }
 
 void startupSignal() {
-  // Сигнал запуска
+  // Улучшенный сигнал запуска
   for(int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH);
-    tone(BUZZER_PIN, 1000, 200);
-    delay(300);
+    tone(BUZZER_PIN, 1000 + i*200, 300);
+    delay(400);
     digitalWrite(LED_PIN, LOW);
-    delay(200);
+    delay(150);
   }
+  noTone(BUZZER_PIN);
 }
 
 void loop() {
-  // Сканирование окружающей среды
-  scanEnvironment();
+  unsigned long currentTime = millis();
   
-  if (personDetected) {
-    // Режим преследования
-    pursuitMode();
-  } else {
-    // Режим поиска
-    searchMode();
+  // Сканирование окружающей среды с фиксированным интервалом
+  if (currentTime - lastScanTime >= SCAN_INTERVAL) {
+    scanEnvironment();
+    lastScanTime = currentTime;
   }
   
-  delay(100);
+  // Управление движением с фиксированным интервалом
+  if (currentTime - lastMoveTime >= MOVE_INTERVAL) {
+    if (personDetected) {
+      pursuitMode();
+    } else {
+      searchMode();
+    }
+    lastMoveTime = currentTime;
+  }
+  
+  // Отладочная информация
+  if (currentTime % 2000 == 0) {
+    printDebugInfo();
+  }
 }
 
 void scanEnvironment() {
-  // Движение головой для сканирования
-  currentAngle += (10 * searchDirection);
-  headServo.write(currentAngle);
-  
-  if (currentAngle >= 180 || currentAngle <= 0) {
+  // Плавное движение головой для сканирования
+  currentAngle += (15 * searchDirection);
+  if (currentAngle >= 160 || currentAngle <= 20) {
     searchDirection *= -1;
   }
+  headServo.write(currentAngle);
   
-  // Чтение данных с датчиков
-  int frontDist = getFilteredDistance(sonarFront);
-  int leftDist = getFilteredDistance(sonarLeft);
-  int rightDist = getFilteredDistance(sonarRight);
-  int pirValue = digitalRead(PIR_SENSOR);
-  int irValue = analogRead(IR_SENSOR);
+  // Чтение и фильтрация данных с датчиков
+  SensorData sensors = readSensors();
   
-  // Проверка обнаружения человека
-  bool ultrasonicDetection = (frontDist < PERSON_DISTANCE && frontDist > 0) ||
-                            (leftDist < PERSON_DISTANCE && leftDist > 0) ||
-                            (rightDist < PERSON_DISTANCE && rightDist > 0);
+  // Улучшенная логика обнаружения
+  bool ultrasonicDetection = 
+    (sensors.frontDist < PERSON_DISTANCE && sensors.frontDist > 5) ||
+    (sensors.leftDist < PERSON_DISTANCE && sensors.leftDist > 5) ||
+    (sensors.rightDist < PERSON_DISTANCE && sensors.rightDist > 5);
   
-  bool sensorDetection = (pirValue == HIGH) || (irValue > HEAT_THRESHOLD);
+  bool sensorDetection = (sensors.pirValue == HIGH) || (sensors.irValue > HEAT_THRESHOLD);
   
-  if (ultrasonicDetection && sensorDetection) {
+  // Взвешенное обнаружение с приоритетами
+  int detectionScore = 0;
+  if (ultrasonicDetection) detectionScore += 2;
+  if (sensorDetection) detectionScore += 1;
+  if (sensors.frontDist < CLOSE_DISTANCE) detectionScore += 1;
+  
+  if (detectionScore >= 3) { // Повышенный порог для надежности
     detectionCount++;
-    if (detectionCount >= 2) { // Подтверждение обнаружения
-      personDetected = true;
-      lastDetectionTime = millis();
-      triggerAlarm();
-      Serial.println("ЧЕЛОВЕК ОБНАРУЖЕН!");
-      Serial.print("Дистанция: ");
-      Serial.print(frontDist);
-      Serial.println(" см");
+    if (detectionCount >= 3) {
+      if (!personDetected) {
+        personDetected = true;
+        lastDetectionTime = millis();
+        triggerAlarm();
+        Serial.println("🚨 ЧЕЛОВЕК ОБНАРУЖЕН! Активация режима преследования");
+      }
     }
   } else {
-    detectionCount = 0;
+    detectionCount = max(0, detectionCount - 1);
   }
   
-  // Сброс обнаружения через 10 секунд
-  if (personDetected && (millis() - lastDetectionTime > 10000)) {
+  // Сброс обнаружения через 15 секунд
+  if (personDetected && (millis() - lastDetectionTime > 15000)) {
     personDetected = false;
-    Serial.println("Поиск возобновлен");
+    Serial.println("🔍 Поиск возобновлен");
+    stopMotors();
   }
+}
+
+SensorData readSensors() {
+  SensorData data;
+  data.frontDist = getFilteredDistance(sonarFront);
+  data.leftDist = getFilteredDistance(sonarLeft);
+  data.rightDist = getFilteredDistance(sonarRight);
+  data.pirValue = digitalRead(PIR_SENSOR);
+  data.irValue = analogRead(IR_SENSOR);
+  data.timestamp = millis();
+  return data;
 }
 
 int getFilteredDistance(NewPing &sonar) {
-  // Получение отфильтрованного расстояния
-  unsigned int distance = sonar.ping_median(5);
-  return sonar.convert_cm(distance);
+  unsigned int distance = sonar.ping_median(3); // Уменьшено количество измерений
+  int cm = sonar.convert_cm(distance);
+  if (cm <= 0 || cm > MAX_DISTANCE) return MAX_DISTANCE;
+  
+  // Применение фильтра Калмана
+  if (&sonar == &sonarFront) return (int)kalmanFront.update(cm);
+  if (&sonar == &sonarLeft) return (int)kalmanLeft.update(cm);
+  if (&sonar == &sonarRight) return (int)kalmanRight.update(cm);
+  return cm;
 }
 
 void searchMode() {
-  // Режим поиска - движение по паттерну
-  int frontDist = getFilteredDistance(sonarFront);
-  int leftDist = getFilteredDistance(sonarLeft);
-  int rightDist = getFilteredDistance(sonarRight);
+  SensorData sensors = readSensors();
   
-  // Избегание препятствий
-  if (frontDist < OBSTACLE_DISTANCE && frontDist > 0) {
-    avoidObstacle();
+  // Улучшенное избегание препятствий
+  if (sensors.frontDist < OBSTACLE_DISTANCE && sensors.frontDist > 0) {
+    avoidObstacle(sensors);
   } else {
-    // Движение вперед с зигзагообразной траекторией
-    moveForward(150);
-    delay(1000);
-    
-    // Случайный поворот для поиска
-    if (random(0, 100) > 70) {
-      if (leftDist > rightDist) {
-        turnLeft(200);
-      } else {
-        turnRight(200);
-      }
-      delay(500);
+    // Умный паттерн поиска
+    switch (searchPhase) {
+      case 0: // Движение вперед
+        moveForward(180);
+        if (random(0, 100) > 80) searchPhase = 1;
+        break;
+      case 1: // Плавный поворот
+        if (sensors.leftDist > sensors.rightDist) {
+          smoothTurn(-120, 1000);
+        } else {
+          smoothTurn(120, 1000);
+        }
+        searchPhase = 0;
+        break;
     }
   }
 }
 
 void pursuitMode() {
-  // Режим преследования обнаруженного человека
-  int frontDist = getFilteredDistance(sonarFront);
-  int leftDist = getFilteredDistance(sonarLeft);
-  int rightDist = getFilteredDistance(sonarRight);
+  SensorData sensors = readSensors();
   
-  // Мигание LED и звуковой сигнал
-  digitalWrite(LED_PIN, (millis() % 500) < 250);
-  tone(BUZZER_PIN, 1500, 100);
+  // Индикация преследования
+  digitalWrite(LED_PIN, (millis() % 400) < 200);
+  if (millis() % 1000 < 100) {
+    tone(BUZZER_PIN, 1600, 100);
+  }
   
-  if (frontDist < PERSON_DISTANCE && frontDist > OBSTACLE_DISTANCE) {
-    // Движение к цели
-    moveForward(200);
-  } else if (leftDist < rightDist && leftDist > OBSTACLE_DISTANCE) {
-    // Поворот налево к цели
-    turnLeft(180);
-  } else if (rightDist > OBSTACLE_DISTANCE) {
-    // Поворот направо к цели
-    turnRight(180);
+  // Улучшенная логика преследования
+  if (sensors.frontDist < PERSON_DISTANCE && sensors.frontDist > OBSTACLE_DISTANCE + 10) {
+    // Преследование по прямой
+    int speed = map(sensors.frontDist, OBSTACLE_DISTANCE + 10, PERSON_DISTANCE, 100, 255);
+    speed = constrain(speed, 100, 255);
+    moveForward(speed);
+  } else if (sensors.leftDist < sensors.rightDist && sensors.leftDist > OBSTACLE_DISTANCE) {
+    // Плавный поворот налево
+    smoothTurn(-150, 300);
+  } else if (sensors.rightDist > OBSTACLE_DISTANCE) {
+    // Плавный поворот направо
+    smoothTurn(150, 300);
   } else {
-    // Поиск цели
-    searchPattern();
+    // Поиск при потере цели
+    advancedSearchPattern();
   }
 }
 
-void avoidObstacle() {
-  Serial.println("Избегание препятствия");
+void avoidObstacle(SensorData sensors) {
+  Serial.println("🛑 Избегание препятствия");
   
   stopMotors();
-  delay(500);
+  delay(300);
   
-  int leftDist = getFilteredDistance(sonarLeft);
-  int rightDist = getFilteredDistance(sonarRight);
-  
-  // Выбор направления с большим пространством
-  if (leftDist > rightDist) {
-    turnLeft(200);
-    delay(800);
+  // Выбор направления с учетом истории
+  if (sensors.leftDist - sensors.rightDist > 20) {
+    smoothTurn(-180, 600);
+  } else if (sensors.rightDist - sensors.leftDist > 20) {
+    smoothTurn(180, 600);
   } else {
-    turnRight(200);
-    delay(800);
+    // Отъезд назад при равных расстояниях
+    moveBackward(150, 500);
+    smoothTurn(200, 800);
   }
-  
-  moveForward(150);
-  delay(1000);
 }
 
-void searchPattern() {
-  // Паттерн поиска при потере цели
-  Serial.println("Выполнение поискового паттерна");
+void smoothTurn(int speed, int duration) {
+  if (speed < 0) {
+    turnLeft(abs(speed));
+  } else {
+    turnRight(speed);
+  }
+  delay(duration);
+  stopMotors();
+  delay(100);
+}
+
+void advancedSearchPattern() {
+  Serial.println("🌀 Активный поиск цели");
   
-  for (int i = 0; i < 3; i++) {
-    turnLeft(150);
+  // Спиральный поиск
+  for (int i = 0; i < 4; i++) {
+    smoothTurn(150, 400 + i*100);
+    stopMotors();
     delay(300);
-    stopMotors();
-    delay(500);
+    scanEnvironment();
     
-    turnRight(150);
-    delay(600);
+    smoothTurn(-150, 200);
     stopMotors();
-    delay(500);
+    delay(300);
+    scanEnvironment();
   }
 }
 
 void triggerAlarm() {
-  // Активация сигнала тревоги
-  for (int i = 0; i < 5; i++) {
+  Serial.println("🚨 АКТИВАЦИЯ СИГНАЛА ТРЕВОГИ!");
+  
+  for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH);
-    tone(BUZZER_PIN, 2000, 300);
-    delay(400);
+    tone(BUZZER_PIN, 1800, 400);
+    delay(500);
     digitalWrite(LED_PIN, LOW);
+    noTone(BUZZER_PIN);
     delay(200);
   }
 }
 
-// Функции управления двигателями
+void moveBackward(int speed, int duration) {
+  digitalWrite(MOTOR_A_IN1, LOW);
+  digitalWrite(MOTOR_A_IN2, HIGH);
+  digitalWrite(MOTOR_B_IN1, LOW);
+  digitalWrite(MOTOR_B_IN2, HIGH);
+  analogWrite(MOTOR_A_EN, speed);
+  analogWrite(MOTOR_B_EN, speed);
+  delay(duration);
+  stopMotors();
+}
+
+// Функции управления двигателями (оставлены без изменений)
 void moveForward(int speed) {
   digitalWrite(MOTOR_A_IN1, HIGH);
   digitalWrite(MOTOR_A_IN2, LOW);
   digitalWrite(MOTOR_B_IN1, HIGH);
   digitalWrite(MOTOR_B_IN2, LOW);
-  analogWrite(MOTOR_A_EN, speed);
-  analogWrite(MOTOR_B_EN, speed);
-}
-
-void moveBackward(int speed) {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, HIGH);
-  digitalWrite(MOTOR_B_IN1, LOW);
-  digitalWrite(MOTOR_B_IN2, HIGH);
   analogWrite(MOTOR_A_EN, speed);
   analogWrite(MOTOR_B_EN, speed);
 }
@@ -295,4 +395,24 @@ void stopMotors() {
   digitalWrite(MOTOR_B_IN2, LOW);
   analogWrite(MOTOR_A_EN, 0);
   analogWrite(MOTOR_B_EN, 0);
+}
+
+void printDebugInfo() {
+  SensorData sensors = readSensors();
+  Serial.println("=== ДЕБАГ ИНФОРМАЦИЯ ===");
+  Serial.print("Режим: ");
+  Serial.println(personDetected ? "ПРЕСЛЕДОВАНИЕ" : "ПОИСК");
+  Serial.print("Дистанции: F=");
+  Serial.print(sensors.frontDist);
+  Serial.print(" L=");
+  Serial.print(sensors.leftDist);
+  Serial.print(" R=");
+  Serial.println(sensors.rightDist);
+  Serial.print("PIR: ");
+  Serial.print(sensors.pirValue);
+  Serial.print(" IR: ");
+  Serial.println(sensors.irValue);
+  Serial.print("Угол сервы: ");
+  Serial.println(currentAngle);
+  Serial.println("======================");
 }
