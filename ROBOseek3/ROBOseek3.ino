@@ -1,4 +1,3 @@
-// Робот-поисковик на Arduino - УЛУЧШЕННАЯ ВЕРСИЯ
 #include <Servo.h>
 #include <NewPing.h>
 
@@ -93,7 +92,7 @@ SimpleKalman kalmanLeft(0.1, 0.1, 1.0);
 SimpleKalman kalmanRight(0.1, 0.1, 1.0);
 
 void setup() {
-  Serial.begin(115200);  // Увеличена скорость
+  Serial.begin(115200); 
   Serial.println("=== Робот-поисковик УЛУЧШЕННЫЙ запущен! ===");
   
   // Настройка пинов двигателей
